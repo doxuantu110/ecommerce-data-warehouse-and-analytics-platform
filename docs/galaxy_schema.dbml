@@ -1,0 +1,100 @@
+// =====================================
+// FACT TABLES
+// =====================================
+
+Table FACT_SALES {
+  sales_key int [primary key]
+  order_id varchar
+  order_item_id int
+  customer_key int
+  product_key int
+  seller_key int
+  date_key int
+  price decimal
+  freight_value decimal
+  Note: 'Grain: 1 product in 1 order'
+}
+
+Table FACT_PAYMENTS {
+  payment_fact_key int [primary key]
+  order_id varchar
+  customer_key int
+  date_key int
+  payment_key int
+  payment_sequential int
+  payment_value decimal
+  payment_installments int
+  Note: 'Grain: 1 payment record'
+}
+
+Table FACT_ORDER_EXPERIENCE {
+  experience_fact_key int [primary key]
+  order_id varchar
+  customer_key int
+  date_key int
+  delivery_days int
+  delay_days int
+  review_score int
+  is_late_delivery boolean
+  Note: 'Grain: 1 order'
+}
+
+// =====================================
+// DIMENSION TABLES
+// =====================================
+
+Table DIM_CUSTOMER {
+  customer_key int [primary key]
+  customer_unique_id varchar
+  customer_state varchar
+  customer_city varchar
+}
+
+Table DIM_PRODUCT {
+  product_key int [primary key]
+  product_id varchar
+  category_name_english varchar
+  weight decimal
+  photos_qty int
+}
+
+Table DIM_SELLER {
+  seller_key int [primary key]
+  seller_id varchar
+  seller_state varchar
+  seller_city varchar
+}
+
+Table DIM_DATE {
+  date_key int [primary key]
+  date date
+  year int
+  quarter int
+  month int
+  weekday varchar
+}
+
+Table DIM_PAYMENT {
+  payment_key int [primary key]
+  payment_type varchar
+  installment_group varchar
+}
+
+// =====================================
+// RELATIONSHIPS (FOREIGN KEYS)
+// =====================================
+
+// Relationships for FACT_SALES
+Ref: FACT_SALES.customer_key > DIM_CUSTOMER.customer_key
+Ref: FACT_SALES.product_key > DIM_PRODUCT.product_key
+Ref: FACT_SALES.seller_key > DIM_SELLER.seller_key
+Ref: FACT_SALES.date_key > DIM_DATE.date_key
+
+// Relationships for FACT_PAYMENTS
+Ref: FACT_PAYMENTS.customer_key > DIM_CUSTOMER.customer_key
+Ref: FACT_PAYMENTS.date_key > DIM_DATE.date_key
+Ref: FACT_PAYMENTS.payment_key > DIM_PAYMENT.payment_key
+
+// Relationships for FACT_ORDER_EXPERIENCE
+Ref: FACT_ORDER_EXPERIENCE.customer_key > DIM_CUSTOMER.customer_key
+Ref: FACT_ORDER_EXPERIENCE.date_key > DIM_DATE.date_key
