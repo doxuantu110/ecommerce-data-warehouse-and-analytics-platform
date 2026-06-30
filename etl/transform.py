@@ -15,7 +15,7 @@ NOTE: dim_date được sinh riêng trong generate_dim_date.py
 import pandas as pd
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 def _add_surrogate_key(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
     """Thêm cột surrogate key tăng dần từ 1 (Kimball convention)."""
@@ -151,7 +151,15 @@ def transform_dim_payment(payments: pd.DataFrame) -> pd.DataFrame:
     return dim
 
 
-# ── Facts ─────────────────────────────────────────────────────────────────────
+# Facts
+#
+# ⚠️ NOTE: Các hàm transform_fact_sales / transform_fact_payments /
+# transform_fact_order_experience bên dưới KHÔNG được dùng trong pipeline thực tế.
+# Logic build fact thật nằm trong wrapper transform() ở cuối file —
+# nơi customer_key được resolve qua customer_id_map TRƯỚC khi build tất cả 3 fact
+# (tránh circular dependency giữa dim và fact).
+# Các hàm dưới đây giữ lại để tham khảo logic transform riêng lẻ, KHÔNG xóa vì
+# dùng cho mục đích học tập/đối chiếu, nhưng entry point luôn gọi transform().
 
 def transform_fact_sales(
     orders: pd.DataFrame,
@@ -334,7 +342,7 @@ def transform_fact_order_experience(
     return fact
 
 
-# ── Main wrapper ──────────────────────────────────────────────────────────────
+# Main wrapper
 
 def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """
@@ -345,13 +353,13 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     dim đã được build — tránh circular dependency.
     """
 
-    # ── 1. Build dimensions ──────────────────────────────────────────────────
+    # 1. Build dimensions
     dim_customer = transform_dim_customer(raw["customers"])
     dim_product  = transform_dim_product(raw["products"], raw["category_translation"])
     dim_seller   = transform_dim_seller(raw["sellers"])
     dim_payment  = transform_dim_payment(raw["payments"])
 
-    # ── 2. Lookup helper: customer_id → customer_key ─────────────────────────
+    # 2. Lookup helper: customer_id → customer_key
     # Olist: customer_id (per-order) → customer_unique_id (per-person) → customer_key
     customer_id_map = (
         raw["customers"][["customer_id", "customer_unique_id"]]
@@ -360,10 +368,11 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
             on="customer_unique_id",
             how="left",
         )
-        [["customer_id", "customer_key"]]
+        [["customer_id", "customer_key", "customer_unique_id"]]
+        # giữ customer_unique_id để load.py remap customer_key từ DB
     )
 
-    # ── 3. Build FACT_SALES ──────────────────────────────────────────────────
+    # 3. Build FACT_SALES
     orders_parsed = raw["orders"].copy()
     orders_parsed["order_purchase_timestamp"] = pd.to_datetime(
         orders_parsed["order_purchase_timestamp"]
@@ -380,28 +389,32 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     fs["date_key"] = _to_date_key(fs["order_purchase_timestamp"])
     fact_sales = fs[[
         "order_id", "order_item_id",
-        "customer_key", "product_key", "seller_key", "date_key",
+        "customer_key", "customer_unique_id",  # giữ để load.py remap customer_key từ DB
+        "product_key", "product_id",
+        "seller_key",  "seller_id",
+        "date_key",
         "price", "freight_value",
     ]].copy()
     fact_sales["price"]         = fact_sales["price"].round(2)
     fact_sales["freight_value"] = fact_sales["freight_value"].round(2)
     print(f"[transform] fact_sales         → {len(fact_sales):>7,} rows")
 
-    # ── 4. Build FACT_PAYMENTS ───────────────────────────────────────────────
+    # 4. Build FACT_PAYMENTS
     fp = raw["payments"].merge(orders_delivered_base, on="order_id", how="inner")
     fp = fp.merge(customer_id_map, on="customer_id", how="left")
     fp = fp.merge(dim_payment[["payment_key", "payment_type"]], on="payment_type", how="left")
     fp["date_key"] = _to_date_key(fp["order_purchase_timestamp"])
     fact_payments = fp[[
         "order_id", "payment_sequential",
-        "customer_key", "date_key", "payment_key",
+        "customer_key", "customer_unique_id",  # giữ để load.py remap customer_key từ DB
+        "date_key", "payment_key",
         "payment_value", "payment_installments",
     ]].copy()
     fact_payments["payment_value"]        = fact_payments["payment_value"].round(2)
     fact_payments["payment_installments"] = fact_payments["payment_installments"].fillna(1).astype(int)
     print(f"[transform] fact_payments      → {len(fact_payments):>7,} rows")
 
-    # ── 5. Build FACT_ORDER_EXPERIENCE ───────────────────────────────────────
+    # 5. Build FACT_ORDER_EXPERIENCE
     for col in [
         "order_purchase_timestamp",
         "order_delivered_customer_date",
@@ -426,12 +439,24 @@ def transform(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     foe = foe.merge(customer_id_map, on="customer_id", how="left")
 
     fact_order_experience = foe[[
-        "order_id", "customer_key", "date_key",
+        "order_id", "customer_key", "customer_unique_id",  # giữ để load.py remap customer_key từ DB
+        "date_key",
         "delivery_days", "delay_days", "review_score", "is_late_delivery",
     ]].copy()
+
+    # FIX: NaN không thể cast sang SMALLINT trong PostgreSQL.
+    # Đơn hàng không có review sẽ có review_score = NaN (float) sau merge "left".
+    # Phải convert tường minh NaN → None (Python) để psycopg2 gửi NULL thay vì NaN.
+    # Ép kiểu sang object trước để Pandas không tự động fallback về float64/NaN
+    fact_order_experience["review_score"] = fact_order_experience["review_score"].astype(object).where(pd.notna(fact_order_experience["review_score"]), None)
+    
+    fact_order_experience["delivery_days"] = fact_order_experience["delivery_days"].astype(object).where(pd.notna(fact_order_experience["delivery_days"]), None)
+    
+    fact_order_experience["delay_days"] = fact_order_experience["delay_days"].astype(object).where(pd.notna(fact_order_experience["delay_days"]), None)
+
     print(f"[transform] fact_order_exp     → {len(fact_order_experience):>7,} rows")
 
-    # ── 6. Return all ────────────────────────────────────────────────────────
+    # 6. Return all
     print(f"\n[transform] Done.\n")
 
     return {
