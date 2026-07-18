@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Logging 
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 def get_engine():
     """
     Tạo SQLAlchemy engine từ biến môi trường.
+    Dùng khi chạy ETL standalone (ngoài Airflow).
     Khi chạy ETL ngoài Docker: POSTGRES_HOST=localhost
     Khi chạy trong Docker network: POSTGRES_HOST=ecommerce_postgres
     """
@@ -53,6 +54,25 @@ def get_engine():
     url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
     engine = create_engine(url, echo=False)
     log.info(f"[load] Connected to PostgreSQL: {host}:{port}/{db}")
+    return engine
+
+
+def get_engine_from_hook(conn_id: str = "postgres_olist_dw"):
+    """
+    Tạo SQLAlchemy engine từ Airflow Connection (PostgresHook).
+    Dùng khi chạy ETL trong Airflow DAG — không hardcode credentials.
+
+    Parameters
+    ----------
+    conn_id : str
+        Airflow Connection ID đã tạo trong Admin → Connections.
+        Mặc định: 'postgres_olist_dw'
+    """
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    hook   = PostgresHook(postgres_conn_id=conn_id)
+    engine = hook.get_sqlalchemy_engine()
+    log.info(f"[load] Connected via Airflow Hook: conn_id={conn_id}")
     return engine
 
 
@@ -144,7 +164,7 @@ def upsert_fact(
     return len(records)
 
 
-# Surrogate key resolution
+# Surrogate key resolution 
 
 def resolve_surrogate_keys(conn, transformed: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """
@@ -200,24 +220,38 @@ def resolve_surrogate_keys(conn, transformed: dict[str, pd.DataFrame]) -> dict[s
     return transformed
 
 
-#  Main load function
+# Main load function 
 
-def load(transformed: dict[str, pd.DataFrame]) -> None:
+def load(
+    transformed: dict[str, pd.DataFrame],
+    engine=None,
+) -> None:
     """
     Load tất cả dim và fact vào PostgreSQL DW.
+
+    Parameters
+    ----------
+    transformed : dict[str, pd.DataFrame]
+        Output của transform().
+    engine : SQLAlchemy engine, optional
+        - None (default): tạo engine từ biến môi trường (.env)
+          → dùng khi chạy standalone: python etl/load.py
+        - Truyền engine từ get_engine_from_hook()
+          → dùng khi chạy trong Airflow DAG (PostgresHook)
 
     Thứ tự bắt buộc:
     1. Dimensions trước (fact có FK trỏ vào dim)
     2. Facts sau
     """
-    engine = get_engine()
+    if engine is None:
+        engine = get_engine()
 
     with get_connection(engine) as conn:
         log.info("=" * 60)
         log.info("[load] START — Loading dimensions")
         log.info("=" * 60)
 
-        # Dimensions
+        #  Dimensions 
         upsert_dim(
             conn,
             transformed["dim_customer"].drop(columns=["customer_key"]),
@@ -246,14 +280,14 @@ def load(transformed: dict[str, pd.DataFrame]) -> None:
             conflict_col="payment_type",
         )
 
-        # Resolve surrogate keys từ DB
+        #  Resolve surrogate keys từ DB 
         # Sau khi dim đã load, đọc lại surrogate key thật từ DB
         cust_map = pd.read_sql("SELECT customer_key, customer_unique_id FROM dw.dim_customer", conn)
         prod_map = pd.read_sql("SELECT product_key, product_id FROM dw.dim_product", conn)
         sell_map = pd.read_sql("SELECT seller_key, seller_id FROM dw.dim_seller", conn)
         pay_map  = pd.read_sql("SELECT payment_key, payment_type FROM dw.dim_payment", conn)
 
-        # fact_sales: resolve customer_key, product_key, seller_key từ DB 
+        #  fact_sales: resolve customer_key, product_key, seller_key từ DB 
         # NOTE: surrogate key sinh trong RAM (transform.py) KHÔNG khớp với
         # SERIAL thật mà PostgreSQL cấp khi insert dim — bắt buộc phải remap
         # cả 3 key này bằng natural key (customer_unique_id / product_id / seller_id).
@@ -263,7 +297,7 @@ def load(transformed: dict[str, pd.DataFrame]) -> None:
         fs = fs.merge(prod_map, on="product_id",         how="left").drop(columns=["product_id"])
         fs = fs.merge(sell_map, on="seller_id",          how="left").drop(columns=["seller_id"])
 
-        # fact_payments: resolve customer_key, payment_key từ DB
+        #  fact_payments: resolve customer_key, payment_key từ DB 
         fp = transformed["fact_payments"].copy()
         # payment_key trong RAM (transform.py) có thể không khớp thứ tự SERIAL
         # mà create_dw.sql đã seed sẵn cho dim_payment — remap lại cho chắc chắn.
@@ -276,7 +310,7 @@ def load(transformed: dict[str, pd.DataFrame]) -> None:
         fp = fp.merge(cust_map, on="customer_unique_id", how="left").drop(columns=["customer_unique_id"])
         fp = fp.merge(pay_map,  on="payment_type",        how="left").drop(columns=["payment_type"])
 
-        # fact_order_experience: resolve customer_key từ DB
+        #  fact_order_experience: resolve customer_key từ DB 
         foe = transformed["fact_order_experience"].copy()
         foe = foe.drop(columns=["customer_key"])
         foe = foe.merge(cust_map, on="customer_unique_id", how="left").drop(columns=["customer_unique_id"])
@@ -311,7 +345,7 @@ def load(transformed: dict[str, pd.DataFrame]) -> None:
         log.info("=" * 60)
 
 
-# Entry point
+# Entry point 
 if __name__ == "__main__":
     from extract import extract
     from transform import transform
