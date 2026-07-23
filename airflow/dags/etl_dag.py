@@ -30,13 +30,13 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-# Thêm etl/ vào sys.path để import các module ETL 
+# ── Thêm etl/ vào sys.path để import các module ETL ──────────────────────────
 # /opt/airflow/etl/ được mount từ ./etl/ trong docker-compose.yml
 sys.path.insert(0, "/opt/airflow/etl")
 
 log = logging.getLogger(__name__)
 
-# Constants 
+# ── Constants ─────────────────────────────────────────────────────────────────
 AIRFLOW_CONN_ID = "postgres_olist_dw"
 
 
@@ -50,17 +50,24 @@ def run_extract(**context):
     Validate tất cả CSV files tồn tại và đọc được.
     Push row counts vào XCom để các task sau log tóm tắt.
     """
+    import time
     from extract import extract
 
+    ti          = context["ti"]
+    retry_count = ti.try_number - 1
+    if retry_count > 0:
+        log.warning(f"[extract_task] RETRY #{retry_count} — previous attempt failed.")
+
     log.info("[extract_task] Starting extraction from source CSV files...")
+    t0  = time.time()
     raw = extract()
+    elapsed = time.time() - t0
 
-    # Push row counts vào XCom (nhỏ, an toàn)
     row_counts = {name: len(df) for name, df in raw.items()}
-    context["ti"].xcom_push(key="row_counts", value=row_counts)
+    ti.xcom_push(key="row_counts", value=row_counts)
 
-    log.info(f"[extract_task] Done. Tables loaded: {list(row_counts.keys())}")
-    log.info(f"[extract_task] Total rows: {sum(row_counts.values()):,}")
+    log.info(f"[extract_task] Done in {elapsed:.1f}s — {len(row_counts)} tables loaded.")
+    log.info(f"[extract_task] Total rows extracted: {sum(row_counts.values()):,}")
 
     return row_counts
 
@@ -74,23 +81,36 @@ def run_transform(**context):
     NOTE: Chạy lại extract() là đúng — không dùng XCom để pass DataFrame
     vì XCom có giới hạn kích thước, không phù hợp cho large DataFrames.
     """
+    import time
     from extract import extract
     from transform import transform
 
+    ti          = context["ti"]
+    retry_count = ti.try_number - 1
+    if retry_count > 0:
+        log.warning(f"[transform_task] RETRY #{retry_count} — previous attempt failed.")
+
     log.info("[transform_task] Running extract + transform...")
+    t0          = time.time()
     raw         = extract()
+    t_extract   = time.time()
     transformed = transform(raw)
+    t_transform = time.time()
 
     shape_summary = {
         name: {"rows": len(df), "cols": len(df.columns)}
         for name, df in transformed.items()
     }
-    context["ti"].xcom_push(key="shape_summary", value=shape_summary)
+    ti.xcom_push(key="shape_summary", value=shape_summary)
 
     for name, info in shape_summary.items():
         log.info(f"[transform_task]   {name:<30} → {info['rows']:>7,} rows × {info['cols']} cols")
 
-    log.info("[transform_task] Done.")
+    log.info(
+        f"[transform_task] Done — extract: {t_extract - t0:.1f}s | "
+        f"transform: {t_transform - t_extract:.1f}s | "
+        f"total: {t_transform - t0:.1f}s"
+    )
     return shape_summary
 
 
@@ -104,20 +124,33 @@ def run_load_dims(**context):
     - FK constraint: fact phải được load SAU dim
     - Dễ retry: nếu fact load lỗi, không cần chạy lại dim
     """
+    import time
     from extract import extract
     from transform import transform
     from load import get_engine_from_hook, get_connection, upsert_dim
     import pandas as pd
 
+    ti          = context["ti"]
+    retry_count = ti.try_number - 1
+    if retry_count > 0:
+        log.warning(
+            f"[load_dim_task] RETRY #{retry_count} — previous attempt failed. "
+            f"UPSERT is idempotent: safe to re-run."
+        )
+
     log.info("[load_dim_task] Connecting via Airflow PostgresHook...")
     engine = get_engine_from_hook(AIRFLOW_CONN_ID)
 
     log.info("[load_dim_task] Running extract + transform...")
+    t0          = time.time()
     raw         = extract()
     transformed = transform(raw)
+    t_etl       = time.time()
+    log.info(f"[load_dim_task] Extract + transform done in {t_etl - t0:.1f}s")
 
     with get_connection(engine) as conn:
         log.info("[load_dim_task] Loading dimensions...")
+        t_load = time.time()
 
         upsert_dim(conn, transformed["dim_customer"].drop(columns=["customer_key"]),
                    table="dim_customer", conflict_col="customer_unique_id")
@@ -131,7 +164,10 @@ def run_load_dims(**context):
         upsert_dim(conn, transformed["dim_payment"].drop(columns=["payment_key"]),
                    table="dim_payment",  conflict_col="payment_type")
 
-    log.info("[load_dim_task] All dimensions loaded successfully.")
+        elapsed = time.time() - t_load
+        log.info(f"[load_dim_task] All dimensions loaded in {elapsed:.1f}s")
+
+    log.info(f"[load_dim_task] Total task time: {time.time() - t0:.1f}s")
 
 
 def run_load_facts(**context):
@@ -143,38 +179,45 @@ def run_load_facts(**context):
     Idempotency: UPSERT on natural key (ON CONFLICT DO UPDATE).
     Chạy lại task nhiều lần sẽ không tạo duplicate rows.
     """
+    import time
     from extract import extract
     from transform import transform
-    from load import (
-        get_engine_from_hook, get_connection,
-        upsert_fact,
-    )
+    from load import get_engine_from_hook, get_connection, upsert_fact
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
     import pandas as pd
+
+    ti          = context["ti"]
+    retry_count = ti.try_number - 1
+    if retry_count > 0:
+        log.warning(
+            f"[load_fact_task] RETRY #{retry_count} — previous attempt failed. "
+            f"UPSERT is idempotent: safe to re-run."
+        )
 
     log.info("[load_fact_task] Connecting via Airflow PostgresHook...")
     engine = get_engine_from_hook(AIRFLOW_CONN_ID)
+    hook   = PostgresHook(postgres_conn_id=AIRFLOW_CONN_ID)
 
     log.info("[load_fact_task] Running extract + transform...")
+    t0          = time.time()
     raw         = extract()
     transformed = transform(raw)
+    t_etl       = time.time()
+    log.info(f"[load_fact_task] Extract + transform done in {t_etl - t0:.1f}s")
 
-    #  Resolve surrogate keys từ DB 
-    # Dùng hook.get_pandas_df() thay vì pd.read_sql() để tránh
-    # pandas 2.x + SQLAlchemy compatibility issue.
-    # PostgresHook.get_pandas_df() tự xử lý connection nội bộ,
-    # không phụ thuộc vào cách pandas detect SQLAlchemy object.
-    from airflow.providers.postgres.hooks.postgres import PostgresHook
-
-    hook = PostgresHook(postgres_conn_id=AIRFLOW_CONN_ID)
-
+    # ── Resolve surrogate keys từ DB ─────────────────────────────────────────
+    # hook.get_pandas_df() tránh pandas 2.x + SQLAlchemy compatibility issue
     log.info("[load_fact_task] Resolving surrogate keys from DB...")
     cust_map = hook.get_pandas_df("SELECT customer_key, customer_unique_id FROM dw.dim_customer")
     prod_map = hook.get_pandas_df("SELECT product_key, product_id FROM dw.dim_product")
     sell_map = hook.get_pandas_df("SELECT seller_key, seller_id FROM dw.dim_seller")
     pay_map  = hook.get_pandas_df("SELECT payment_key, payment_type FROM dw.dim_payment")
+    log.info(f"[load_fact_task] Surrogate keys resolved in {time.time() - t_etl:.1f}s")
 
     with get_connection(engine) as conn:
-        #  fact_sales 
+        t_load = time.time()
+
+        # ── fact_sales ────────────────────────────────────────────────────────
         fs = transformed["fact_sales"].copy()
         fs = fs.drop(columns=["customer_key", "product_key", "seller_key"])
         fs = fs.merge(cust_map, on="customer_unique_id", how="left").drop(columns=["customer_unique_id"])
@@ -186,7 +229,7 @@ def run_load_facts(**context):
                     conflict_cols=["order_id", "order_item_id"],
                     update_cols=["price", "freight_value"])
 
-        #  fact_payments 
+        # ── fact_payments ─────────────────────────────────────────────────────
         fp = transformed["fact_payments"].copy()
         fp = fp.merge(
             transformed["dim_payment"][["payment_key", "payment_type"]],
@@ -201,7 +244,7 @@ def run_load_facts(**context):
                     conflict_cols=["order_id", "payment_sequential"],
                     update_cols=["payment_value", "payment_installments"])
 
-        #  fact_order_experience 
+        # ── fact_order_experience ─────────────────────────────────────────────
         foe = transformed["fact_order_experience"].copy()
         foe = foe.drop(columns=["customer_key"])
         foe = foe.merge(cust_map, on="customer_unique_id", how="left").drop(columns=["customer_unique_id"])
@@ -211,7 +254,10 @@ def run_load_facts(**context):
                     conflict_cols=["order_id"],
                     update_cols=["delivery_days", "delay_days", "review_score", "is_late_delivery"])
 
-    log.info("[load_fact_task] All fact tables loaded successfully.")
+        elapsed_load = time.time() - t_load
+        log.info(f"[load_fact_task] All fact tables loaded in {elapsed_load:.1f}s")
+
+    log.info(f"[load_fact_task] Total task time: {time.time() - t0:.1f}s")
 
 
 def run_quality_checks(**context):
@@ -228,11 +274,17 @@ def run_quality_checks(**context):
     - Uniqueness   : không có duplicate natural key
     - Referential  : FK integrity giữa fact và dim
     """
+    import time
     from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    ti          = context["ti"]
+    retry_count = ti.try_number - 1
+    if retry_count > 0:
+        log.warning(f"[quality_check] RETRY #{retry_count} (retries=0 for this task — should not happen)")
 
     hook = PostgresHook(postgres_conn_id=AIRFLOW_CONN_ID)
 
-    #  Định nghĩa tất cả checks 
+    # ── Định nghĩa tất cả checks ─────────────────────────────────────────────
     checks = [
         # (check_id, check_name, sql, expect_zero)
         # expect_zero=True  → query phải trả về 0 (không có vi phạm)
@@ -349,9 +401,10 @@ def run_quality_checks(**context):
          True),
     ]
 
-    #  Chạy từng check 
+    # ── Chạy từng check ──────────────────────────────────────────────────────
     failed_checks = []
-    passed = 0
+    passed        = 0
+    t0            = time.time()
 
     for check_id, check_name, sql, expect_zero in checks:
         result = hook.get_first(sql)
@@ -371,9 +424,10 @@ def run_quality_checks(**context):
             failed_checks.append(f"{check_id} {check_name} → {value:,}")
             log.error(f"[quality_check] {check_id} {status}  {check_name} → {value:,}")
 
-    #  Summary 
+    # ── Summary ───────────────────────────────────────────────────────────────
     total = len(checks)
-    log.info(f"[quality_check] Result: {passed}/{total} checks passed.")
+    elapsed = time.time() - t0
+    log.info(f"[quality_check] Result: {passed}/{total} checks passed in {elapsed:.1f}s.")
 
     if failed_checks:
         fail_msg = "\n".join(failed_checks)
@@ -381,7 +435,7 @@ def run_quality_checks(**context):
             f"Data quality check FAILED — {len(failed_checks)}/{total} checks failed:\n{fail_msg}"
         )
 
-    log.info("[quality_check] All checks passed. Pipeline complete.")
+    log.info(f"[quality_check] All {total} checks passed. Pipeline complete. ({elapsed:.1f}s)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -435,6 +489,6 @@ with DAG(
         retries=0,
     )
 
-    #  Dependencies 
+    # ── Dependencies ──────────────────────────────────────────────────────────
     # extract → transform → load_dim → load_fact → quality_check
     extract_task >> transform_task >> load_dim_task >> load_fact_task >> quality_check_task
